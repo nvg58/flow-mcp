@@ -10,6 +10,7 @@ export const PLAYBOOK = {
     "No call blocks for more than about 45 s. A reply with still_working and a task_id means Flow is still busy with it: pass the task_id to flow_wait, and never repeat the call.",
   ],
   models: {
+    "Omni 1.2 Flash": "3 credits a second up to 10s (4s = 12, 8s = 24, 10s = 30), 6 a second beyond (15s = 60), 720p. Any whole length from 3 to 15s via a Length slider; 360p/720p. Newest Omni (Nov 2026); 1.1 leaves Flow on Dec 5.",
     "Omni 1.1 Flash": "7 credits at 4s, 12 at 8s (720p). Supports duration 4/6/8/10 and 360p/720p. Best default for drafts and frame-to-frame transitions.",
     "Veo 3.1 - Lite": "10 credits, fixed 8s.",
     "Veo 3.1 - Fast": "20 credits, fixed 8s.",

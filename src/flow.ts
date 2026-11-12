@@ -307,6 +307,23 @@ async function openSettings(page: Page): Promise<void> {
   if (!(await probe.isVisible().catch(() => false))) throw new Error("Could not open Flow's generation settings popover.");
 }
 
+// Omni 1.1 offers 4s/6s/8s/10s radios; Omni 1.2 (2026-11) a "Length" slider whose steps 0-12 are 3-15 seconds.
+async function pickDuration(page: Page, seconds: number): Promise<void> {
+  const radio = page.getByRole("radio", { name: `${seconds}s`, exact: true }).first();
+  if (await radio.isVisible().catch(() => false)) return pickRadio(page, `${seconds}s`);
+  const slider = page.locator('input[type="range"][aria-label="Length"]').first();
+  if (!(await slider.isVisible().catch(() => false))) throw new Error(`Flow has no ${seconds}s length for the current model.`);
+  const min = Number((await slider.getAttribute("min")) ?? 0);
+  const max = Number((await slider.getAttribute("max")) ?? 12);
+  const step = seconds - 3;
+  if (step < min || step > max) throw new Error(`Flow's length slider has no ${seconds}s (3-${max + 3}s).`);
+  await slider.focus();
+  await page.keyboard.press("Home");
+  for (let i = min; i < step; i++) await page.keyboard.press("ArrowRight");
+  await pause(page, 400);
+  if (Number(await slider.inputValue()) !== step) throw new Error(`Could not set Flow's length to ${seconds}s.`);
+}
+
 async function pickRadio(page: Page, name: string | RegExp): Promise<void> {
   const radio = page.getByRole("radio", { name, exact: typeof name === "string" }).first();
   if (!(await radio.isVisible().catch(() => false))) {
@@ -369,7 +386,7 @@ async function applySettings(page: Page, job: Job): Promise<number> {
   const model = s.type === "image" && LEGACY_IMAGE_MODEL.test(s.model ?? "") ? LATEST_IMAGE_MODEL : s.model;
   if (model) await pickModel(page, model);
   if (s.type === "video" && s.resolution) await pickRadio(page, new RegExp(`^${s.resolution}`));
-  if (s.type === "video" && s.duration) await pickRadio(page, `${s.duration}s`);
+  if (s.type === "video" && s.duration) await pickDuration(page, s.duration);
   await pickRadio(page, `x${s.variants ?? 1}`);
   await pause(page, 600);
   const costText = await page.getByRole("link", { name: /credits?$/ }).innerText();
