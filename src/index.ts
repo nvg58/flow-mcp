@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { LocalCore, shapes, type Core } from "./core.js";
 import { PLAYBOOK } from "./playbook.js";
-import { RemoteCore } from "./remote.js";
+import { RemoteCore, heldTasks, taskContext } from "./remote.js";
 import { PORT, startServer } from "./server.js";
 
 const local = new LocalCore();
@@ -35,8 +35,9 @@ const WAIT_MS = Math.max(5_000, PATIENCE_MS - 5_000);
 type Task = { task_id: string; tool: string; started: string; status: "running" | "done" | "failed"; result?: unknown; error?: string };
 const tasks = new Map<string, Task>();
 
-const patient = async (tool: string, work: Promise<unknown>): Promise<unknown> => {
+const patient = async (tool: string, run: () => Promise<unknown>): Promise<unknown> => {
   const task: Task = { task_id: `task-${randomUUID().slice(0, 8)}`, tool, started: new Date().toISOString(), status: "running" };
+  const work = taskContext.run(task.task_id, run);
   const settled = work.then(
     (result) => {
       task.status = "done";
@@ -66,17 +67,27 @@ async function waitFor({ job_ids, timeout_seconds }: { job_ids?: string[]; timeo
   const isTask = (id: string) => tasks.has(id) || id.startsWith("task-");
   const mine = (job_ids ?? []).filter(isTask);
   const jobs = job_ids?.filter((id) => !isTask(id));
-  while (Date.now() < deadline && mine.some((id) => tasks.get(id)?.status === "running")) await new Promise((r) => setTimeout(r, 1000));
-  // A task id this process never issued belongs to a tool process that has since restarted: its answer is gone, but the
-  // work may well have happened, so say that instead of reporting it finished.
-  const done = mine.map(
-    (id) =>
-      tasks.get(id) ?? {
-        task_id: id,
-        status: "unknown",
-        note: "This tool restarted since that call, so its answer is lost. Check Flow (flow_assets, flow_characters) for what it did before running it again.",
-      },
-  );
+  // A task id this process never issued belongs to another tool process. The owner process keeps those answers when it
+  // served the call; otherwise the answer is gone, but the work may well have happened, so say that instead of
+  // reporting it finished.
+  const lookup = async (): Promise<Record<string, unknown>[]> => {
+    const away = mine.filter((id) => !tasks.has(id));
+    const kept = role === "client" && away.length ? (await heldTasks(away)).tasks : [];
+    return mine.map(
+      (id) =>
+        (tasks.get(id) as Record<string, unknown> | undefined) ??
+        kept[away.indexOf(id)] ?? {
+          task_id: id,
+          status: "unknown",
+          note: "This tool restarted since that call, so its answer is lost. Check Flow (flow_assets, flow_characters) for what it did before running it again.",
+        },
+    );
+  };
+  let done = await lookup();
+  while (Date.now() < deadline && done.some((t) => t.status === "running")) {
+    await new Promise((r) => setTimeout(r, 1000));
+    done = await lookup();
+  }
   const tasksFinished = done.every((t) => t.status !== "running");
   if (mine.length && !jobs?.length) return { finished: tasksFinished, tasks: done };
   const left = Math.max(5, Math.floor((deadline - Date.now()) / 1000));
@@ -150,7 +161,7 @@ server.registerTool(
     inputSchema: shapes.assets,
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  (args) => reply(patient("flow_assets", core.assets(args))),
+  (args) => reply(patient("flow_assets", () => core.assets(args))),
 );
 
 server.registerTool(
@@ -162,7 +173,7 @@ server.registerTool(
     inputSchema: shapes.download,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
-  (args) => reply(patient("flow_download", core.download(args))),
+  (args) => reply(patient("flow_download", () => core.download(args))),
 );
 
 server.registerTool(
@@ -198,7 +209,7 @@ server.registerTool(
     inputSchema: shapes.continue_shot,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
-  (args) => reply(patient("flow_continue", core.continue_shot(args))),
+  (args) => reply(patient("flow_continue", () => core.continue_shot(args))),
 );
 
 server.registerTool(
@@ -210,7 +221,7 @@ server.registerTool(
     inputSchema: shapes.trash,
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   },
-  (args) => reply(patient("flow_trash", core.trash(args))),
+  (args) => reply(patient("flow_trash", () => core.trash(args))),
 );
 
 server.registerTool(
@@ -222,7 +233,7 @@ server.registerTool(
     inputSchema: shapes.character,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
-  (args) => reply(patient("flow_character", core.character(args))),
+  (args) => reply(patient("flow_character", () => core.character(args))),
 );
 
 server.registerTool(
@@ -234,7 +245,7 @@ server.registerTool(
     inputSchema: shapes.character_edit,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
-  (args) => reply(patient("flow_character_edit", core.character_edit(args))),
+  (args) => reply(patient("flow_character_edit", () => core.character_edit(args))),
 );
 
 server.registerTool(
@@ -245,7 +256,7 @@ server.registerTool(
     inputSchema: shapes.characters,
     annotations: { readOnlyHint: true, openWorldHint: true },
   },
-  () => reply(patient("flow_characters", core.characters())),
+  () => reply(patient("flow_characters", () => core.characters())),
 );
 
 server.registerTool(
@@ -269,7 +280,7 @@ server.registerTool(
     inputSchema: shapes.narrate,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   },
-  (args) => reply(patient("flow_narrate", core.narrate(args))),
+  (args) => reply(patient("flow_narrate", () => core.narrate(args))),
 );
 
 server.registerTool(
@@ -292,7 +303,7 @@ server.registerTool(
     inputSchema: shapes.assemble,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
-  (args) => reply(patient("flow_assemble", core.assemble(args))),
+  (args) => reply(patient("flow_assemble", () => core.assemble(args))),
 );
 
 server.registerTool(
@@ -304,7 +315,7 @@ server.registerTool(
     inputSchema: shapes.transcribe,
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
-  (args) => reply(patient("flow_transcribe", core.transcribe(args))),
+  (args) => reply(patient("flow_transcribe", () => core.transcribe(args))),
 );
 
 server.registerTool(
@@ -316,7 +327,7 @@ server.registerTool(
     inputSchema: shapes.captions,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
-  (args) => reply(patient("flow_captions", core.captions(args))),
+  (args) => reply(patient("flow_captions", () => core.captions(args))),
 );
 
 await server.connect(new StdioServerTransport());

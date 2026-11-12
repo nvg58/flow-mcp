@@ -1,17 +1,32 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import type { Core } from "./core.js";
 import { PORT, TOKEN_FILE } from "./server.js";
+
+// The task id of the slow call in progress, sent along so the owner process keeps the answer (see heldTasks).
+export const taskContext = new AsyncLocalStorage<string>();
 
 // Used when another flow-mcp process (Studio or a second Claude client) already owns the Flow tab and queue.
 async function call(method: string, args: unknown): Promise<unknown> {
   const res = await fetch(`http://127.0.0.1:${PORT}/api/${method}`, {
     method: "POST",
-    headers: { "content-type": "application/json", "x-flow-token": readFileSync(TOKEN_FILE, "utf8").trim() },
+    headers: {
+      "content-type": "application/json",
+      "x-flow-token": readFileSync(TOKEN_FILE, "utf8").trim(),
+      ...(taskContext.getStore() ? { "x-flow-task": taskContext.getStore() } : {}),
+    },
     body: JSON.stringify(args ?? {}),
   });
   const data = (await res.json()) as { error?: string };
   if (!res.ok) throw new Error(data.error ?? `flow-mcp owner process answered ${res.status}`);
   return data;
+}
+
+// Answers the owner process kept for slow calls made by tool processes that have since exited. Apps that start one
+// tool process per call (Paperclip) kill it right after the reply, so a still_working task id is only useful if the
+// owner holds the result.
+export async function heldTasks(ids: string[]): Promise<{ tasks: (Record<string, unknown> | null)[] }> {
+  return (await call("task_results", { ids })) as { tasks: (Record<string, unknown> | null)[] };
 }
 
 export class RemoteCore implements Core {

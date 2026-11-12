@@ -62,6 +62,11 @@ export type ServerRole = "owner" | "client" | "none";
 
 // Serves the Studio panel and a JSON API on localhost. Returns "client" when another flow-mcp process already
 // owns the port (that process owns the Flow tab and the queue), "none" when the port is taken by something else.
+// Results of slow calls whose caller sent x-flow-task, kept so a later flow_wait from another tool process can collect them.
+interface HeldTask { task_id: string; tool: string; started: string; status: "running" | "done" | "failed"; result?: unknown; error?: string; settled?: number }
+const held = new Map<string, HeldTask>();
+const HELD_FOR_MS = 6 * 3600_000;
+
 export async function startServer(core: Core): Promise<ServerRole> {
   mkdirSync(UPLOAD_DIR, { recursive: true });
   const token = randomBytes(24).toString("hex");
@@ -92,12 +97,28 @@ export async function startServer(core: Core): Promise<ServerRole> {
         return json(res, 200, { path });
       }
 
+      if (req.method === "POST" && url.pathname === "/api/task_results") {
+        const { ids } = JSON.parse((await readBody(req, 64 * 1024)).toString() || "{}") as { ids?: string[] };
+        return json(res, 200, { tasks: (ids ?? []).map((id) => held.get(id) ?? null) });
+      }
+
       const method = url.pathname.match(/^\/api\/(\w+)$/)?.[1] as keyof Core | undefined;
       if (req.method === "POST" && method && typeof core[method] === "function") {
         const raw = (await readBody(req, 1024 * 1024)).toString() || "{}";
         const shape = (shapes as Record<string, z.ZodRawShape>)[method];
         const args = shape ? z.object(shape).parse(JSON.parse(raw)) : undefined;
-        return json(res, 200, await (core[method] as (a: unknown) => Promise<unknown>)(args));
+        const work = (core[method] as (a: unknown) => Promise<unknown>)(args);
+        const taskId = req.headers["x-flow-task"];
+        if (typeof taskId === "string" && /^task-[\w-]{1,40}$/.test(taskId)) {
+          const task: HeldTask = { task_id: taskId, tool: method, started: new Date().toISOString(), status: "running" };
+          held.set(taskId, task);
+          work.then(
+            (result) => Object.assign(task, { status: "done", result, settled: Date.now() }),
+            (err) => Object.assign(task, { status: "failed", error: err instanceof Error ? err.message : String(err), settled: Date.now() }),
+          );
+          for (const [id, t] of held) if (t.settled && Date.now() - t.settled > HELD_FOR_MS) held.delete(id);
+        }
+        return json(res, 200, await work);
       }
       json(res, 404, { error: "Not found." });
     } catch (err) {
